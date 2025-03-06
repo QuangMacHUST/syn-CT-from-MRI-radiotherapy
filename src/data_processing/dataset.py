@@ -52,7 +52,8 @@ class MRIToCTDataset(Dataset):
                         print(f"Cảnh báo: File {file_path} không chứa dữ liệu MRI, bỏ qua.")
                         continue
                     
-                    mri_data = f['mri'][:]
+                    # Lấy dữ liệu MRI và chuyển thành numpy array
+                    mri_data = np.array(f['mri'])
                     
                     # Kiểm tra xem file có dữ liệu CT không nếu là dữ liệu ghép cặp
                     if self.paired and 'ct' not in f:
@@ -88,7 +89,8 @@ class MRIToCTDataset(Dataset):
         
         try:
             with h5py.File(file_path, 'r') as f:
-                mri_volume = f['mri'][:]
+                # Lấy dữ liệu và chuyển thành numpy array
+                mri_volume = np.array(f['mri'])
                 
                 # Kiểm tra kích thước dữ liệu
                 if self.slice_axis >= len(mri_volume.shape):
@@ -105,7 +107,7 @@ class MRIToCTDataset(Dataset):
                 # Đọc slice CT tương ứng nếu dữ liệu được ghép cặp
                 ct_slice = None
                 if self.paired and 'ct' in f:
-                    ct_volume = f['ct'][:]
+                    ct_volume = np.array(f['ct'])
                     
                     # Kiểm tra kích thước dữ liệu CT và MRI khớp nhau
                     if ct_volume.shape != mri_volume.shape:
