@@ -4,6 +4,8 @@ pytorch-lightning
 pydicom
 nibabel
 scikit-image
+scikit-learn
+seaborn
 SimpleITK
 matplotlib
 numpy

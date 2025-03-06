@@ -10,11 +10,31 @@ data:
 
 # Cấu hình mô hình
 model:
+  type: cyclegan  # Loại mô hình: cyclegan, unet, pix2pix, attentiongan, unit
   input_nc: 1  # Số kênh đầu vào (MRI)
   output_nc: 1  # Số kênh đầu ra (CT)
   ngf: 64  # Số filter cơ bản cho generator
   ndf: 64  # Số filter cơ bản cho discriminator
   n_blocks: 9  # Số khối residual trong generator
+  
+  # Cấu hình riêng cho từng loại mô hình
+  cyclegan:
+    # Không có cấu hình riêng
+  
+  unet:
+    bilinear: true  # Sử dụng upsampling bilinear thay vì transposed convolution
+  
+  pix2pix:
+    use_dropout: true  # Sử dụng dropout trong generator
+    norm_layer: instance  # Loại normalization: instance, batch
+  
+  attentiongan:
+    # Không có cấu hình riêng
+  
+  unit:
+    latent_dim: 512  # Kích thước không gian tiềm ẩn
+    n_encoder_blocks: 3  # Số khối residual trong encoder
+    n_decoder_blocks: 3  # Số khối residual trong decoder
 
 # Cấu hình huấn luyện
 training:
@@ -49,6 +69,7 @@ evaluation:
 
 # Cấu hình chuyển đổi ảnh mô phỏng
 inference:
+  model_type: cyclegan  # Loại mô hình sử dụng: cyclegan, unet, pix2pix, attentiongan, unit
   checkpoint: best_model.pth
   input_dir: data/test/mri
   output_dir: data/output/synthetic_ct

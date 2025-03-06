@@ -2,112 +2,122 @@
 # -*- coding: utf-8 -*-
 
 import numpy as np
-from skimage.metrics import structural_similarity as ssim
-from skimage.metrics import peak_signal_noise_ratio as psnr
-from skimage.metrics import mean_squared_error
+import torch
+import skimage.metrics
+from functools import partial
 
 def calculate_metrics(pred, gt, mask=None):
     """
-    Tính toán các metrics đánh giá chất lượng chuyển đổi
+    Tính toán các chỉ số MAE, RMSE, PSNR, SSIM
     
     Args:
-        pred (numpy.ndarray): Ảnh dự đoán
-        gt (numpy.ndarray): Ảnh ground truth
-        mask (numpy.ndarray, optional): Mặt nạ cho vùng quan tâm
-    
+        pred (numpy.ndarray): Ảnh dự đoán (CT mô phỏng)
+        gt (numpy.ndarray): Ảnh ground truth (CT thật)
+        mask (numpy.ndarray, optional): Mask để tính toán metrics trên vùng cụ thể
+        
     Returns:
-        dict: Dictionary chứa các metrics
+        dict: Dictionary chứa các chỉ số đánh giá
     """
-    # Chắc chắn rằng pred và gt có cùng shape
-    assert pred.shape == gt.shape, f"Shapes don't match: {pred.shape} vs {gt.shape}"
+    # Chuyển tensor thành numpy
+    if isinstance(pred, torch.Tensor):
+        pred = pred.detach().cpu().numpy()
+    if isinstance(gt, torch.Tensor):
+        gt = gt.detach().cpu().numpy()
+    if isinstance(mask, torch.Tensor) and mask is not None:
+        mask = mask.detach().cpu().numpy()
+    
+    # Đảm bảo data là 2D
+    if pred.ndim > 2:
+        pred = pred.squeeze()
+    if gt.ndim > 2:
+        gt = gt.squeeze()
+    if mask is not None and mask.ndim > 2:
+        mask = mask.squeeze()
     
     # Áp dụng mask nếu có
     if mask is not None:
-        assert mask.shape == pred.shape, f"Mask shape {mask.shape} doesn't match pred shape {pred.shape}"
-        pred = pred * mask
-        gt = gt * mask
+        pred = pred[mask > 0]
+        gt = gt[mask > 0]
     
-    # Tính Mean Absolute Error (MAE)
+    # Tính MAE
     mae = np.mean(np.abs(pred - gt))
     
-    # Tính Mean Squared Error (MSE)
-    mse = mean_squared_error(gt, pred)
+    # Tính RMSE
+    rmse = np.sqrt(np.mean((pred - gt) ** 2))
     
-    # Tính Root Mean Squared Error (RMSE)
-    rmse = np.sqrt(mse)
+    # Tính PSNR (cần chuẩn hóa ảnh về khoảng [0, 1] cho skimage)
+    # Đối với ảnh CT (HU), ta thường chuyển từ [-1000, 3000] sang [0, 1]
+    pred_normalized = (pred - pred.min()) / (pred.max() - pred.min())
+    gt_normalized = (gt - gt.min()) / (gt.max() - gt.min())
     
-    # Tính Peak Signal-to-Noise Ratio (PSNR)
     try:
-        psnr_val = psnr(gt, pred, data_range=gt.max() - gt.min())
+        psnr_value = skimage.metrics.peak_signal_noise_ratio(gt_normalized, pred_normalized)
     except:
-        psnr_val = 0
+        psnr_value = 0
     
-    # Tính Structural Similarity Index (SSIM)
+    # Tính SSIM
     try:
-        ssim_val = ssim(gt, pred, data_range=gt.max() - gt.min(), multichannel=False)
+        ssim_value = skimage.metrics.structural_similarity(
+            pred_normalized, 
+            gt_normalized,
+            data_range=1.0
+        )
     except:
-        ssim_val = 0
+        ssim_value = 0
     
     return {
         'mae': mae,
-        'mse': mse,
         'rmse': rmse,
-        'psnr': psnr_val,
-        'ssim': ssim_val
+        'psnr': psnr_value,
+        'ssim': ssim_value
     }
 
-def calculate_tissue_metrics(pred, gt, tissue_mask):
+def calculate_tissue_metrics(pred, gt, tissue_masks):
     """
-    Tính toán metrics cho các loại mô khác nhau
+    Tính toán chỉ số MAE cho từng loại mô
     
     Args:
-        pred (numpy.ndarray): Ảnh dự đoán
-        gt (numpy.ndarray): Ảnh ground truth
-        tissue_mask (dict): Dictionary chứa các mặt nạ cho từng loại mô
-                            Ví dụ: {'bone': bone_mask, 'soft_tissue': soft_mask, ...}
-    
-    Returns:
-        dict: Dictionary chứa các metrics cho từng loại mô
-    """
-    results = {}
-    
-    for tissue_name, mask in tissue_mask.items():
-        # Tính metrics cho từng loại mô
-        tissue_metrics = calculate_metrics(pred, gt, mask)
+        pred (numpy.ndarray): Ảnh dự đoán (CT mô phỏng)
+        gt (numpy.ndarray): Ảnh ground truth (CT thật)
+        tissue_masks (dict): Dictionary chứa các mask cho từng loại mô
         
-        # Lưu kết quả với tên mô
-        for metric_name, value in tissue_metrics.items():
-            results[f"{tissue_name}_{metric_name}"] = value
+    Returns:
+        dict: Dictionary chứa MAE cho từng loại mô
+    """
+    metrics = {}
     
-    return results
+    for tissue_name, mask in tissue_masks.items():
+        tissue_metrics = calculate_metrics(pred, gt, mask)
+        metrics[f"{tissue_name}_mae"] = tissue_metrics['mae']
+        metrics[f"{tissue_name}_rmse"] = tissue_metrics['rmse']
+    
+    return metrics
 
 def calculate_hu_metrics(pred_hu, gt_hu, hu_ranges):
     """
-    Tính toán sai số trong các khoảng HU khác nhau
+    Tính toán chỉ số MAE trong các khoảng HU khác nhau
     
     Args:
-        pred_hu (numpy.ndarray): Giá trị HU dự đoán
-        gt_hu (numpy.ndarray): Giá trị HU ground truth
-        hu_ranges (list): Danh sách các khoảng HU cần tính
-                          Ví dụ: [(-1000, -100), (-100, 100), (100, 1000)]
-    
-    Returns:
-        dict: Dictionary chứa các metrics cho các khoảng HU
-    """
-    results = {}
-    
-    for i, (lower, upper) in enumerate(hu_ranges):
-        # Tạo mask cho khoảng HU
-        mask = (gt_hu >= lower) & (gt_hu <= upper)
+        pred_hu (numpy.ndarray): Ảnh dự đoán (CT mô phỏng) đơn vị HU
+        gt_hu (numpy.ndarray): Ảnh ground truth (CT thật) đơn vị HU
+        hu_ranges (list): Danh sách các khoảng HU, ví dụ: [(-1000, -100), (-100, 100)]
         
-        # Bỏ qua nếu không có pixel nào trong khoảng
+    Returns:
+        dict: Dictionary chứa MAE cho từng khoảng HU
+    """
+    metrics = {}
+    
+    for i, (min_hu, max_hu) in enumerate(hu_ranges):
+        # Tạo mask cho khoảng HU
+        mask = (gt_hu >= min_hu) & (gt_hu <= max_hu)
+        
+        # Nếu không có pixel nào trong khoảng, bỏ qua
         if np.sum(mask) == 0:
+            metrics[f"hu_range_{min_hu}_{max_hu}_mae"] = 0
             continue
         
-        # Tính MAE cho khoảng HU
-        mae = np.mean(np.abs(pred_hu[mask] - gt_hu[mask]))
-        
-        # Lưu kết quả
-        results[f"hu_range_{lower}_{upper}_mae"] = mae
+        # Tính metrics trên mask
+        range_metrics = calculate_metrics(pred_hu, gt_hu, mask)
+        metrics[f"hu_range_{min_hu}_{max_hu}_mae"] = range_metrics['mae']
     
-    return results 
+    return metrics 

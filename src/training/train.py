@@ -17,13 +17,15 @@ import sys
 # Thêm thư mục gốc vào đường dẫn
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from src.models.cycle_gan import CycleGANModel, gan_loss, cycle_consistency_loss, identity_loss
+# Import tất cả các mô hình
+from src.models import AVAILABLE_MODELS
+from src.models.cycle_gan import gan_loss, cycle_consistency_loss, identity_loss
 from src.data_processing.dataset import MRIToCTDataModule
 from src.utils.visualization import save_images, visualize_results
 from src.utils.metrics import calculate_metrics
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Huấn luyện mô hình CycleGAN cho chuyển đổi MRI sang CT')
+    parser = argparse.ArgumentParser(description='Huấn luyện mô hình cho chuyển đổi MRI sang CT')
     parser.add_argument('--config', type=str, default='configs/default.yaml',
                         help='Đường dẫn đến file cấu hình')
     parser.add_argument('--resume', type=str, default=None,
@@ -34,8 +36,8 @@ def load_config(config_path):
     with open(config_path, 'r') as f:
         return yaml.safe_load(f)
 
-class CycleGANTrainer:
-    """Lớp huấn luyện mô hình CycleGAN"""
+class ModelTrainer:
+    """Lớp huấn luyện chung cho tất cả các loại mô hình"""
     
     def __init__(self, config, resume_path=None):
         """
@@ -45,6 +47,12 @@ class CycleGANTrainer:
         """
         self.config = config
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model_type = config['model']['type'].lower()
+        
+        # Kiểm tra mô hình có được hỗ trợ không
+        if self.model_type not in AVAILABLE_MODELS:
+            raise ValueError(f"Loại mô hình không hợp lệ: {self.model_type}. "
+                            f"Các loại mô hình được hỗ trợ: {', '.join(AVAILABLE_MODELS.keys())}")
         
         # Cấu hình đường dẫn
         self.output_dir = Path(config['training']['output_dir'])
@@ -74,54 +82,125 @@ class CycleGANTrainer:
         self.train_loader = self.data_module.train_dataloader()
         self.val_loader = self.data_module.val_dataloader()
         
-        # Khởi tạo mô hình
-        self.model = CycleGANModel(
-            input_nc=config['model']['input_nc'],
-            output_nc=config['model']['output_nc'],
-            ngf=config['model']['ngf'],
-            ndf=config['model']['ndf']
-        ).to(self.device)
+        # Khởi tạo mô hình dựa trên loại
+        self._init_model()
         
         # Khởi tạo optimizers
-        self.optimizer_G = optim.Adam(
-            list(self.model.netG_A.parameters()) + list(self.model.netG_B.parameters()),
-            lr=config['training']['lr'],
-            betas=(config['training']['beta1'], 0.999)
-        )
-        
-        self.optimizer_D = optim.Adam(
-            list(self.model.netD_A.parameters()) + list(self.model.netD_B.parameters()),
-            lr=config['training']['lr'],
-            betas=(config['training']['beta1'], 0.999)
-        )
+        self._init_optimizers()
         
         # Khởi tạo learning rate schedulers
-        self.scheduler_G = optim.lr_scheduler.StepLR(
-            self.optimizer_G,
-            step_size=config['training']['lr_decay_epochs'],
-            gamma=config['training']['lr_decay_gamma']
-        )
+        self._init_schedulers()
         
-        self.scheduler_D = optim.lr_scheduler.StepLR(
-            self.optimizer_D,
-            step_size=config['training']['lr_decay_epochs'],
-            gamma=config['training']['lr_decay_gamma']
-        )
-        
-        # Hyperparameters
-        self.lambda_A = config['training']['lambda_A']  # weight for cycle loss A -> B -> A
-        self.lambda_B = config['training']['lambda_B']  # weight for cycle loss B -> A -> B
-        self.lambda_identity = config['training']['lambda_identity']  # weight for identity loss
-        
-        # Training state
+        # Thiết lập trạng thái huấn luyện
         self.start_epoch = 0
         self.current_epoch = 0
         self.current_iter = 0
         self.best_val_loss = float('inf')
         
-        # Load checkpoint nếu có
-        if resume_path is not None:
+        # Tải checkpoint nếu có
+        if resume_path:
             self._load_checkpoint(resume_path)
+            
+    def _init_model(self):
+        """Khởi tạo mô hình dựa trên loại đã chọn"""
+        model_class = AVAILABLE_MODELS[self.model_type]
+        
+        # Các tham số chung cho tất cả các mô hình
+        common_params = {
+            'input_nc': self.config['model']['input_nc'],
+            'output_nc': self.config['model']['output_nc'],
+        }
+        
+        # Tham số riêng cho từng loại mô hình
+        if self.model_type == 'cyclegan':
+            self.model = model_class(
+                **common_params,
+                ngf=self.config['model']['ngf'],
+                ndf=self.config['model']['ndf']
+            ).to(self.device)
+        elif self.model_type == 'unet':
+            bilinear = self.config['model'].get('unet', {}).get('bilinear', True)
+            self.model = model_class(
+                **common_params,
+                ngf=self.config['model']['ngf'],
+                bilinear=bilinear
+            ).to(self.device)
+        elif self.model_type == 'pix2pix':
+            use_dropout = self.config['model'].get('pix2pix', {}).get('use_dropout', True)
+            norm_layer_name = self.config['model'].get('pix2pix', {}).get('norm_layer', 'instance')
+            
+            # Chọn lớp normalization
+            if norm_layer_name == 'instance':
+                norm_layer = nn.InstanceNorm2d
+            else:
+                norm_layer = nn.BatchNorm2d
+                
+            self.model = model_class(
+                **common_params,
+                ngf=self.config['model']['ngf'],
+                ndf=self.config['model']['ndf'],
+                norm_layer=norm_layer
+            ).to(self.device)
+        elif self.model_type == 'attentiongan':
+            self.model = model_class(
+                **common_params,
+                ngf=self.config['model']['ngf'],
+                ndf=self.config['model']['ndf'],
+                n_blocks=self.config['model']['n_blocks']
+            ).to(self.device)
+        elif self.model_type == 'unit':
+            latent_dim = self.config['model'].get('unit', {}).get('latent_dim', 512)
+            n_encoder_blocks = self.config['model'].get('unit', {}).get('n_encoder_blocks', 3)
+            
+            self.model = model_class(
+                **common_params,
+                nef=self.config['model']['ngf'],
+                ndf=self.config['model']['ndf'],
+                n_blocks=n_encoder_blocks,
+                latent_dim=latent_dim
+            ).to(self.device)
+    
+    def _init_optimizers(self):
+        """Khởi tạo các optimizer cho mô hình"""
+        if self.model_type == 'cyclegan':
+            self.optimizer_G = optim.Adam(
+                list(self.model.netG_A.parameters()) + list(self.model.netG_B.parameters()),
+                lr=self.config['training']['lr'],
+                betas=(self.config['training']['beta1'], 0.999)
+            )
+            
+            self.optimizer_D = optim.Adam(
+                list(self.model.netD_A.parameters()) + list(self.model.netD_B.parameters()),
+                lr=self.config['training']['lr'],
+                betas=(self.config['training']['beta1'], 0.999)
+            )
+        else:
+            self.optimizer = optim.Adam(
+                self.model.parameters(),
+                lr=self.config['training']['lr'],
+                betas=(self.config['training']['beta1'], 0.999)
+            )
+    
+    def _init_schedulers(self):
+        """Khởi tạo các learning rate scheduler cho mô hình"""
+        if self.model_type == 'cyclegan':
+            self.scheduler_G = optim.lr_scheduler.StepLR(
+                self.optimizer_G,
+                step_size=self.config['training']['lr_decay_epochs'],
+                gamma=self.config['training']['lr_decay_gamma']
+            )
+            
+            self.scheduler_D = optim.lr_scheduler.StepLR(
+                self.optimizer_D,
+                step_size=self.config['training']['lr_decay_epochs'],
+                gamma=self.config['training']['lr_decay_gamma']
+            )
+        else:
+            self.scheduler = optim.lr_scheduler.StepLR(
+                self.optimizer,
+                step_size=self.config['training']['lr_decay_epochs'],
+                gamma=self.config['training']['lr_decay_gamma']
+            )
     
     def _load_checkpoint(self, checkpoint_path):
         """Load checkpoint từ đường dẫn"""
@@ -129,18 +208,21 @@ class CycleGANTrainer:
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         
         # Load model weights
-        self.model.netG_A.load_state_dict(checkpoint['netG_A'])
-        self.model.netG_B.load_state_dict(checkpoint['netG_B'])
-        self.model.netD_A.load_state_dict(checkpoint['netD_A'])
-        self.model.netD_B.load_state_dict(checkpoint['netD_B'])
+        self.model.load_state_dict(checkpoint['model'])
         
         # Load optimizer states
-        self.optimizer_G.load_state_dict(checkpoint['optimizer_G'])
-        self.optimizer_D.load_state_dict(checkpoint['optimizer_D'])
+        if self.model_type == 'cyclegan':
+            self.optimizer_G.load_state_dict(checkpoint['optimizer_G'])
+            self.optimizer_D.load_state_dict(checkpoint['optimizer_D'])
+        else:
+            self.optimizer.load_state_dict(checkpoint['optimizer'])
         
         # Load scheduler states
-        self.scheduler_G.load_state_dict(checkpoint['scheduler_G'])
-        self.scheduler_D.load_state_dict(checkpoint['scheduler_D'])
+        if self.model_type == 'cyclegan':
+            self.scheduler_G.load_state_dict(checkpoint['scheduler_G'])
+            self.scheduler_D.load_state_dict(checkpoint['scheduler_D'])
+        else:
+            self.scheduler.load_state_dict(checkpoint['scheduler'])
         
         # Load training state
         self.start_epoch = checkpoint['epoch'] + 1
@@ -151,155 +233,229 @@ class CycleGANTrainer:
         print(f"Checkpoint loaded. Resuming from epoch {self.start_epoch}")
     
     def _save_checkpoint(self, epoch, is_best=False):
-        """Lưu checkpoint hiện tại"""
-        checkpoint = {
-            'epoch': epoch,
-            'iter': self.current_iter,
-            'netG_A': self.model.netG_A.state_dict(),
-            'netG_B': self.model.netG_B.state_dict(),
-            'netD_A': self.model.netD_A.state_dict(),
-            'netD_B': self.model.netD_B.state_dict(),
-            'optimizer_G': self.optimizer_G.state_dict(),
-            'optimizer_D': self.optimizer_D.state_dict(),
-            'scheduler_G': self.scheduler_G.state_dict(),
-            'scheduler_D': self.scheduler_D.state_dict(),
-            'best_val_loss': self.best_val_loss
-        }
+        """Lưu checkpoint mô hình"""
+        checkpoint_path = self.checkpoint_dir / f'checkpoint_epoch_{epoch}.pth'
         
-        # Lưu checkpoint thông thường
-        filename = f"checkpoint_epoch_{epoch}.pth"
-        torch.save(checkpoint, self.checkpoint_dir / filename)
+        # Tạo state dict tùy theo loại mô hình
+        if self.model_type == 'cyclegan':
+            state_dict = {
+                'epoch': epoch,
+                'iter': self.current_iter,
+                'netG_A': self.model.netG_A.state_dict(),
+                'netG_B': self.model.netG_B.state_dict(),
+                'netD_A': self.model.netD_A.state_dict(),
+                'netD_B': self.model.netD_B.state_dict(),
+                'optimizer_G': self.optimizer_G.state_dict(),
+                'optimizer_D': self.optimizer_D.state_dict(),
+                'scheduler_G': self.scheduler_G.state_dict(),
+                'scheduler_D': self.scheduler_D.state_dict(),
+                'best_val_loss': self.best_val_loss
+            }
+        else:
+            state_dict = {
+                'epoch': epoch,
+                'iter': self.current_iter,
+                'model': self.model.state_dict(),
+                'optimizer': self.optimizer.state_dict(),
+                'scheduler': self.scheduler.state_dict(),
+                'best_val_loss': self.best_val_loss
+            }
         
-        # Lưu checkpoint tốt nhất
+        # Lưu checkpoint
+        torch.save(state_dict, checkpoint_path)
+        print(f"Đã lưu checkpoint tại {checkpoint_path}")
+        
+        # Lưu checkpoint tốt nhất nếu cần
         if is_best:
-            torch.save(checkpoint, self.checkpoint_dir / 'best_model.pth')
-            print(f"Saved best model checkpoint at epoch {epoch}")
+            best_path = self.checkpoint_dir / 'best_model.pth'
+            torch.save(state_dict, best_path)
+            print(f"Đã lưu checkpoint tốt nhất tại {best_path}")
     
     def _set_train_mode(self):
         """Đặt mô hình ở chế độ huấn luyện"""
-        self.model.netG_A.train()
-        self.model.netG_B.train()
-        self.model.netD_A.train()
-        self.model.netD_B.train()
+        self.model.train()
     
     def _set_eval_mode(self):
         """Đặt mô hình ở chế độ đánh giá"""
-        self.model.netG_A.eval()
-        self.model.netG_B.eval()
-        self.model.netD_A.eval()
-        self.model.netD_B.eval()
+        self.model.eval()
     
     def train_step(self, batch):
         """Thực hiện một bước huấn luyện"""
+        # Lấy dữ liệu từ batch
         real_A = batch['mri'].to(self.device)
         real_B = batch['ct'].to(self.device) if 'ct' in batch else None
         
-        # -----------------
-        # Huấn luyện Generator
-        # -----------------
-        self.optimizer_G.zero_grad()
+        # Khởi tạo các biến loss
+        loss_G = torch.tensor(0.0, device=self.device)
+        loss_D = torch.tensor(0.0, device=self.device)
+        loss_cycle_A = torch.tensor(0.0, device=self.device)
+        loss_cycle_B = torch.tensor(0.0, device=self.device)
+        loss_idt_A = torch.tensor(0.0, device=self.device)
+        loss_idt_B = torch.tensor(0.0, device=self.device)
+        loss_G_B = torch.tensor(0.0, device=self.device)
+        loss_D_B = torch.tensor(0.0, device=self.device)
+        loss_D_real = torch.tensor(0.0, device=self.device)
+        loss_D_fake = torch.tensor(0.0, device=self.device)
         
-        # Forward
-        outputs = self.model(real_A, real_B)
-        fake_B = outputs['fake_B']
-        
-        # Identity loss
-        if self.lambda_identity > 0 and real_B is not None:
-            # G_A should be identity if real_B is fed: ||G_A(B) - B||
-            idt_A = self.model.netG_A(real_B)
-            loss_idt_A = identity_loss(real_B, idt_A, self.lambda_identity)
+        # Xử lý dựa trên loại mô hình
+        if self.model_type == 'cyclegan':
+            # CycleGAN có 2 generator và 2 discriminator
+            self.optimizer_G.zero_grad()
             
-            # G_B should be identity if real_A is fed: ||G_B(A) - A||
-            idt_B = self.model.netG_B(real_A)
-            loss_idt_B = identity_loss(real_A, idt_B, self.lambda_identity)
-        else:
-            loss_idt_A = 0
-            loss_idt_B = 0
-        
-        # GAN loss D_A(G_A(A))
-        pred_fake = self.model.netD_A(fake_B)
-        loss_G_A = gan_loss(pred_fake, True)
-        
-        # Cycle loss
-        if real_B is not None:
-            fake_A = outputs['fake_A']
-            rec_A = outputs['rec_A']
-            rec_B = outputs['rec_B']
+            # Forward
+            outputs = self.model(real_A, real_B)
+            fake_B = outputs['fake_B']
             
-            # Forward cycle loss || G_B(G_A(A)) - A||
-            loss_cycle_A = cycle_consistency_loss(real_A, rec_A, self.lambda_A)
+            # Identity loss
+            if self.config['training'].get('lambda_identity', 0) > 0 and real_B is not None:
+                # G_A should be identity if real_B is fed: ||G_A(B) - B||
+                idt_A = self.model.netG_A(real_B)
+                loss_idt_A = identity_loss(real_B, idt_A, self.config['training']['lambda_identity'])
+                
+                # G_B should be identity if real_A is fed: ||G_B(A) - A||
+                idt_B = self.model.netG_B(real_A)
+                loss_idt_B = identity_loss(real_A, idt_B, self.config['training']['lambda_identity'])
             
-            # Backward cycle loss || G_A(G_B(B)) - B||
-            loss_cycle_B = cycle_consistency_loss(real_B, rec_B, self.lambda_B)
+            # GAN loss D_A(G_A(A))
+            pred_fake = self.model.netD_A(fake_B)
+            loss_G = gan_loss(pred_fake, True)
             
-            # GAN loss D_B(G_B(B))
-            pred_fake = self.model.netD_B(fake_A)
-            loss_G_B = gan_loss(pred_fake, True)
-        else:
-            loss_cycle_A = 0
-            loss_cycle_B = 0
-            loss_G_B = 0
-        
-        # Tổng hợp tất cả generator losses
-        loss_G = loss_G_A + loss_G_B + loss_cycle_A + loss_cycle_B + loss_idt_A + loss_idt_B
-        
-        # Backward và optimize
-        loss_G.backward()
-        self.optimizer_G.step()
-        
-        # -----------------
-        # Huấn luyện Discriminator
-        # -----------------
-        self.optimizer_D.zero_grad()
-        
-        # Discriminator A
-        # Thật
-        pred_real = self.model.netD_A(real_B) if real_B is not None else None
-        loss_D_real = gan_loss(pred_real, True) if pred_real is not None else 0
-        
-        # Giả (cập nhật lại để không tính gradient cho generators)
-        fake_B = self.model.netG_A(real_A).detach()
-        pred_fake = self.model.netD_A(fake_B)
-        loss_D_fake = gan_loss(pred_fake, False)
-        
-        # Kết hợp loss
-        loss_D_A = (loss_D_real + loss_D_fake) * 0.5
-        
-        # Discriminator B
-        if real_B is not None:
+            # Cycle loss
+            if real_B is not None:
+                fake_A = outputs['fake_A']
+                rec_A = outputs['rec_A']
+                rec_B = outputs['rec_B']
+                
+                # Forward cycle loss || G_B(G_A(A)) - A||
+                loss_cycle_A = cycle_consistency_loss(real_A, rec_A, self.config['training']['lambda_A'])
+                
+                # Backward cycle loss || G_A(G_B(B)) - B||
+                loss_cycle_B = cycle_consistency_loss(real_B, rec_B, self.config['training']['lambda_B'])
+                
+                # GAN loss D_B(G_B(B))
+                pred_fake_B = self.model.netD_B(fake_A)
+                loss_G_B = gan_loss(pred_fake_B, True)
+            
+            # Tổng hợp tất cả generator losses
+            loss_G = loss_G + loss_G_B + loss_cycle_A + loss_cycle_B + loss_idt_A + loss_idt_B
+            
+            # Backward và optimize
+            loss_G.backward()
+            self.optimizer_G.step()
+            
+            # Huấn luyện Discriminator
+            self.optimizer_D.zero_grad()
+            
+            # Discriminator A
             # Thật
-            pred_real = self.model.netD_B(real_A)
-            loss_D_real = gan_loss(pred_real, True)
+            pred_real = self.model.netD_A(real_B) if real_B is not None else None
+            loss_D_real = gan_loss(pred_real, True) if pred_real is not None else 0
             
             # Giả
-            fake_A = self.model.netG_B(real_B).detach()
-            pred_fake = self.model.netD_B(fake_A)
+            pred_fake = self.model.netD_A(fake_B.detach())
             loss_D_fake = gan_loss(pred_fake, False)
             
             # Kết hợp loss
-            loss_D_B = (loss_D_real + loss_D_fake) * 0.5
-        else:
-            loss_D_B = 0
-        
-        # Tổng hợp tất cả discriminator losses
-        loss_D = loss_D_A + loss_D_B
-        
-        # Backward và optimize
-        loss_D.backward()
-        self.optimizer_D.step()
+            loss_D = (loss_D_real + loss_D_fake) * 0.5 if real_B is not None else loss_D_fake
+            
+            # Discriminator B
+            if real_B is not None:
+                # Thật
+                pred_real = self.model.netD_B(real_A)
+                loss_D_B_real = gan_loss(pred_real, True)
+                
+                # Giả
+                pred_fake = self.model.netD_B(fake_A.detach())
+                loss_D_B_fake = gan_loss(pred_fake, False)
+                
+                # Kết hợp
+                loss_D_B = (loss_D_B_real + loss_D_B_fake) * 0.5
+            
+            # Tổng hợp tất cả discriminator losses
+            loss_D = loss_D + loss_D_B if real_B is not None else loss_D
+            
+            # Backward và optimize
+            loss_D.backward()
+            self.optimizer_D.step()
+            
+        elif self.model_type in ['unet', 'pix2pix', 'attentiongan', 'unit']:
+            # Các mô hình khác có quy trình huấn luyện đơn giản hơn
+            self.optimizer.zero_grad()
+            
+            # Forward
+            outputs = self.model(real_A, real_B)
+            fake_B = outputs['fake_B']
+            
+            # Loss cho generator
+            if self.model_type == 'unet':
+                # UNet chỉ sử dụng L1 loss
+                loss_G = nn.L1Loss()(fake_B, real_B) if real_B is not None else 0
+            elif self.model_type == 'pix2pix':
+                # Pix2Pix sử dụng kết hợp L1 và GAN loss
+                loss_l1 = nn.L1Loss()(fake_B, real_B) * self.config['training'].get('lambda_L1', 100)
+                loss_gan = self.model.discriminate(real_A, fake_B)
+                loss_G = loss_l1 + loss_gan
+            elif self.model_type == 'attentiongan':
+                # AttentionGAN tương tự như CycleGAN
+                fake_A = outputs['fake_A'] if 'fake_A' in outputs else None
+                rec_A = outputs['rec_A'] if 'rec_A' in outputs else None
+                rec_B = outputs['rec_B'] if 'rec_B' in outputs else None
+                
+                # Tính toán tất cả các loss cần thiết
+                if real_B is not None:
+                    loss_cycle_A = cycle_consistency_loss(real_A, rec_A, self.config['training']['lambda_A'])
+                    loss_cycle_B = cycle_consistency_loss(real_B, rec_B, self.config['training']['lambda_B'])
+                    loss_G = loss_G + loss_cycle_A + loss_cycle_B
+            elif self.model_type == 'unit':
+                # UNIT sử dụng kết hợp nhiều loss
+                loss_recon = 0
+                if real_B is not None:
+                    loss_recon = nn.L1Loss()(fake_B, real_B) * self.config['training'].get('lambda_recon', 10)
+                
+                loss_gan = 0
+                if 'disc_loss' in outputs:
+                    loss_gan = outputs['disc_loss']
+                
+                loss_kl = 0
+                if 'kl_loss' in outputs:
+                    loss_kl = outputs['kl_loss'] * self.config['training'].get('lambda_kl', 0.1)
+                
+                loss_G = loss_recon + loss_gan + loss_kl
+            
+            # Optimize generator
+            loss_G.backward()
+            self.optimizer.step()
+            
+            # Huấn luyện discriminator cho các mô hình cần
+            if self.model_type in ['pix2pix', 'attentiongan', 'unit']:
+                self.optimizer.zero_grad()
+                
+                # Discriminator loss
+                if real_B is not None:
+                    if self.model_type == 'pix2pix':
+                        loss_D_real = gan_loss(self.model.discriminator(real_A, real_B), True)
+                        loss_D_fake = gan_loss(self.model.discriminator(real_A, fake_B.detach()), False)
+                    elif self.model_type == 'attentiongan':
+                        loss_D_real = gan_loss(self.model.netD_A(real_B), True)
+                        loss_D_fake = gan_loss(self.model.netD_A(fake_B.detach()), False)
+                    elif self.model_type == 'unit':
+                        loss_D_real = gan_loss(self.model.discriminate(real_B, domain='B'), True)
+                        loss_D_fake = gan_loss(self.model.discriminate(fake_B.detach(), domain='B'), False)
+                    
+                    loss_D = (loss_D_real + loss_D_fake) * 0.5
+                    loss_D.backward()
+                    self.optimizer.step()
         
         # Trả về losses để logging
         losses = {
             'loss_G': loss_G.item(),
-            'loss_G_A': loss_G_A.item(),
-            'loss_G_B': loss_G_B.item() if real_B is not None else 0,
-            'loss_cycle_A': loss_cycle_A.item() if real_B is not None else 0,
-            'loss_cycle_B': loss_cycle_B.item() if real_B is not None else 0,
+            'loss_cycle_A': loss_cycle_A.item() if isinstance(loss_cycle_A, torch.Tensor) and real_B is not None else 0,
+            'loss_cycle_B': loss_cycle_B.item() if isinstance(loss_cycle_B, torch.Tensor) and real_B is not None else 0,
             'loss_idt_A': loss_idt_A.item() if isinstance(loss_idt_A, torch.Tensor) else 0,
             'loss_idt_B': loss_idt_B.item() if isinstance(loss_idt_B, torch.Tensor) else 0,
-            'loss_D': loss_D.item(),
-            'loss_D_A': loss_D_A.item(),
-            'loss_D_B': loss_D_B.item() if real_B is not None else 0
+            'loss_D': loss_D.item() if isinstance(loss_D, torch.Tensor) else 0,
+            'loss_D_real': loss_D_real.item() if isinstance(loss_D_real, torch.Tensor) else 0,
+            'loss_D_fake': loss_D_fake.item() if isinstance(loss_D_fake, torch.Tensor) else 0
         }
         
         return losses, outputs
@@ -308,10 +464,9 @@ class CycleGANTrainer:
         """Đánh giá mô hình trên tập validation"""
         self._set_eval_mode()
         val_losses = {
-            'loss_G': 0, 'loss_G_A': 0, 'loss_G_B': 0,
-            'loss_cycle_A': 0, 'loss_cycle_B': 0,
+            'loss_G': 0, 'loss_cycle_A': 0, 'loss_cycle_B': 0,
             'loss_idt_A': 0, 'loss_idt_B': 0,
-            'loss_D': 0, 'loss_D_A': 0, 'loss_D_B': 0
+            'loss_D': 0, 'loss_D_real': 0, 'loss_D_fake': 0
         }
         
         metrics = {'mae': 0, 'psnr': 0, 'ssim': 0}
@@ -364,10 +519,9 @@ class CycleGANTrainer:
             # Training
             self._set_train_mode()
             train_losses = {
-                'loss_G': 0, 'loss_G_A': 0, 'loss_G_B': 0,
-                'loss_cycle_A': 0, 'loss_cycle_B': 0,
+                'loss_G': 0, 'loss_cycle_A': 0, 'loss_cycle_B': 0,
                 'loss_idt_A': 0, 'loss_idt_B': 0,
-                'loss_D': 0, 'loss_D_A': 0, 'loss_D_B': 0
+                'loss_D': 0, 'loss_D_real': 0, 'loss_D_fake': 0
             }
             
             # Tạo progress bar
@@ -426,12 +580,18 @@ class CycleGANTrainer:
                 self.writer.add_scalar(f'val/{key}', value, self.current_epoch)
             
             # Update learning rates
-            self.scheduler_G.step()
-            self.scheduler_D.step()
+            if self.model_type == 'cyclegan':
+                self.scheduler_G.step()
+                self.scheduler_D.step()
+            else:
+                self.scheduler.step()
             
             # Log learning rates
-            self.writer.add_scalar('lr/G', self.scheduler_G.get_last_lr()[0], self.current_epoch)
-            self.writer.add_scalar('lr/D', self.scheduler_D.get_last_lr()[0], self.current_epoch)
+            if self.model_type == 'cyclegan':
+                self.writer.add_scalar('lr/G', self.scheduler_G.get_last_lr()[0], self.current_epoch)
+                self.writer.add_scalar('lr/D', self.scheduler_D.get_last_lr()[0], self.current_epoch)
+            else:
+                self.writer.add_scalar('lr', self.scheduler.get_last_lr()[0], self.current_epoch)
             
             # Save model checkpoint
             is_best = val_metrics['mae'] < self.best_val_loss
@@ -454,7 +614,7 @@ def main():
     args = parse_args()
     config = load_config(args.config)
     
-    trainer = CycleGANTrainer(config, args.resume)
+    trainer = ModelTrainer(config, args.resume)
     trainer.train()
 
 if __name__ == '__main__':
