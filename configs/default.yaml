@@ -1,0 +1,59 @@
+# Cấu hình dữ liệu
+data:
+  raw_mri_dir: data/raw/mri
+  raw_ct_dir: data/raw/ct
+  processed_dir: data/processed
+  output_dir: data/output
+  paired: true  # Dữ liệu MRI và CT đã ghép cặp
+  slice_axis: 0  # 0: axial, 1: coronal, 2: sagittal
+  slice_range: null  # null để lấy tất cả slices
+
+# Cấu hình mô hình
+model:
+  input_nc: 1  # Số kênh đầu vào (MRI)
+  output_nc: 1  # Số kênh đầu ra (CT)
+  ngf: 64  # Số filter cơ bản cho generator
+  ndf: 64  # Số filter cơ bản cho discriminator
+  n_blocks: 9  # Số khối residual trong generator
+
+# Cấu hình huấn luyện
+training:
+  output_dir: data/output/models
+  batch_size: 8
+  num_workers: 4
+  num_epochs: 100
+  lr: 0.0002
+  beta1: 0.5
+  lambda_A: 10.0  # Trọng số cho cycle loss A -> B -> A
+  lambda_B: 10.0  # Trọng số cho cycle loss B -> A -> B
+  lambda_identity: 0.5  # Trọng số cho identity loss
+  log_interval: 100  # Khoảng thời gian để log
+  save_interval: 5  # Khoảng epoch để lưu checkpoint
+  lr_decay_epochs: 50  # Số epoch để giảm learning rate
+  lr_decay_gamma: 0.1  # Hệ số giảm learning rate
+
+# Cấu hình đánh giá
+evaluation:
+  test_batch_size: 1
+  output_dir: data/output/evaluation
+  save_results: true
+  metrics:
+    - mae
+    - psnr
+    - ssim
+  hu_ranges:  # Khoảng Hounsfield Units để đánh giá
+    - [-1000, -100]  # Không khí và phổi
+    - [-100, 100]    # Mô mềm
+    - [100, 1000]    # Xương
+    - [1000, 3000]   # Implant (kim loại)
+
+# Cấu hình chuyển đổi ảnh mô phỏng
+inference:
+  checkpoint: best_model.pth
+  input_dir: data/test/mri
+  output_dir: data/output/synthetic_ct
+  batch_size: 1
+  device: cuda  # cuda hoặc cpu
+  save_dicom: true
+  window_width: 400  # Giá trị window width cho CT
+  window_center: 40  # Giá trị window center cho CT

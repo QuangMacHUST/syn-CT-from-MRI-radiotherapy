@@ -1,0 +1,17 @@
+torch
+torchvision
+pytorch-lightning
+pydicom
+nibabel
+scikit-image
+SimpleITK
+matplotlib
+numpy
+pandas
+pyyaml
+tensorboard
+opencv-python
+tqdm
+monai
+h5py
+pillow 
